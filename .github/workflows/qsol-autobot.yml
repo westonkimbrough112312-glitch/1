@@ -220,4 +220,4 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(os.sys.argv))python scripts/qphone_guard.py init
+    raise SystemExit(main(os.sys.argv))python 
