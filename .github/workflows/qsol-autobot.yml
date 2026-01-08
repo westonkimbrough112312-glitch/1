@@ -1,222 +1,223 @@
 import os
-import sys
-import time
+import json
+import base64
 import pathlib
+import secrets
 from datetime import datetime
 
 import blake3
-
-# ---------- Paths and constants ----------
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LINEAGE = ROOT / "lineage"
 LINEAGE.mkdir(exist_ok=True)
 
-AUDIT_REPORT_PATH = LINEAGE / "audit_report.md"
-HASH_MANIFEST_PATH = LINEAGE / "hash_manifest.txt"
+KEYS_DIR = LINEAGE / "qphone_keys"
+KEYS_DIR.mkdir(exist_ok=True)
 
-# ---------- Environment capture ----------
+LOG_PATH = LINEAGE / "qphone_activity.log"
 
-ENV = {
-    "GITHUB_RUN_ID": os.getenv("GITHUB_RUN_ID"),
-    "GITHUB_SHA": os.getenv("GITHUB_SHA"),
-    "GITHUB_REF": os.getenv("GITHUB_REF"),
-    "GITHUB_ACTOR": os.getenv("GITHUB_ACTOR"),
-    "GITHUB_REPOSITORY": os.getenv("GITHUB_REPOSITORY"),
-    "GITHUB_WORKFLOW": os.getenv("GITHUB_WORKFLOW"),
-    "QSOL_MODE": os.getenv("QSOL_MODE", "production"),
-    "QSOL_ENV": os.getenv("QSOL_ENV", "actions"),
-}
-
-# ---------- Logging ----------
 
 def log(msg: str) -> None:
     now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    print(f"[{now}] {msg}", flush=True)
+    line = f"[{now}] {msg}"
+    print(line)
+    with LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
-def run_step(name: str, func) -> dict:
-    """
-    Run a Python function as a step, capture timing and errors.
-    Returns a dict with {name, status, duration, error}.
-    """
-    log(f"=== STEP START: {name} ===")
-    start = time.time()
-    status = "SUCCESS"
-    error = None
-
-    try:
-        func()
-    except Exception as exc:
-        status = "FAILED"
-        error = str(exc)
-        log(f"!!! STEP FAILED: {name} :: {exc}")
-    finally:
-        duration = time.time() - start
-        log(f"=== STEP END: {name} (status={status}, duration={duration:.2f}s) ===")
-
-    return {
-        "name": name,
-        "status": status,
-        "duration": duration,
-        "error": error,
-    }
-
-# ---------- Core functional steps ----------
-
-def step_tests() -> None:
-    """
-    Production hook for tests.
-    Right now it's a placeholder that always passes.
-    Replace with real test logic (pytest, unit tests, etc.).
-    """
-    # Example: integrate real tests later:
-    # import subprocess
-    # result = subprocess.run(["pytest", "-q"], cwd=ROOT)
-    # if result.returncode != 0:
-    #     raise RuntimeError("Tests failed")
-
-    log("Running tests placeholder: all tests assumed passing.")
-    # Do lightweight sanity checks here if desired.
-    # For now, no-op.
-
-
-def step_build() -> None:
-    """
-    Production hook for build.
-    Right now it's a placeholder that always passes.
-    Replace with real build logic (codegen, docs, artifacts, etc.).
-    """
-    log("Running build placeholder: no-op build.")
-    # Example for later:
-    # - generate docs
-    # - compile schemas
-    # - produce artifacts into /dist or /build
-
-
-def blake3_hash_file(path: pathlib.Path) -> str:
+def blake3_hex(data: bytes) -> str:
     h = blake3.blake3()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            if not chunk:
-                break
-            h.update(chunk)
+    h.update(data)
     return h.hexdigest()
 
 
-def step_hash_repo() -> None:
+def get_default_key_path() -> pathlib.Path:
+    return KEYS_DIR / "qphone_default_key.json"
+
+
+def generate_key() -> dict:
     """
-    Walk the repo and compute a BLAKE3 manifest of all files (excluding .git).
-    Writes to lineage/hash_manifest.txt.
+    Generate a strong symmetric key for phone security.
+    AES-GCM with 256-bit key, anchored with BLAKE3.
     """
-    log(f"Computing BLAKE3 hash manifest under {ROOT}")
-    lines = []
+    key_bytes = AESGCM.generate_key(bit_length=256)
+    key_id = blake3_hex(key_bytes)[:32]
 
-    for p in ROOT.rglob("*"):
-        if p.is_file() and ".git" not in p.parts:
-            digest = blake3_hash_file(p)
-            rel = p.relative_to(ROOT)
-            lines.append(f"{digest}  {rel}")
+    key_record = {
+        "key_id": key_id,
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "algorithm": "AES-256-GCM",
+        "entropy_source": "secrets.token_bytes + AESGCM.generate_key",
+        "key_b64": base64.b64encode(key_bytes).decode("ascii"),
+    }
 
-    HASH_MANIFEST_PATH.write_text("\n".join(sorted(lines)))
-    log(f"Updated BLAKE3 manifest at {HASH_MANIFEST_PATH}")
+    return key_record
 
 
-def step_zkp_verify() -> None:
+def save_key(key_record: dict, path: pathlib.Path | None = None) -> pathlib.Path:
+    if path is None:
+        path = get_default_key_path()
+
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(key_record, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+    log(f"Saved qphone key at {path} (key_id={key_record['key_id']})")
+    return path
+
+
+def load_key(path: pathlib.Path | None = None) -> dict:
+    if path is None:
+        path = get_default_key_path()
+    if not path.exists():
+        raise FileNotFoundError(f"No key found at {path}. Run 'init' first.")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data
+
+
+def encrypt_secret(plaintext: str, key_record: dict) -> dict:
+    key_bytes = base64.b64decode(key_record["key_b64"])
+    aesgcm = AESGCM(key_bytes)
+
+    nonce = secrets.token_bytes(12)  # 96-bit nonce
+    ct = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)
+
+    ciphertext_b64 = base64.b64encode(ct).decode("ascii")
+    nonce_b64 = base64.b64encode(nonce).decode("ascii")
+
+    record = {
+        "version": 1,
+        "algorithm": key_record["algorithm"],
+        "key_id": key_record["key_id"],
+        "nonce_b64": nonce_b64,
+        "ciphertext_b64": ciphertext_b64,
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "plaintext_hash_b3": blake3_hex(plaintext.encode("utf-8")),
+    }
+
+    return record
+
+
+def decrypt_secret(enc_record: dict, key_record: dict) -> str:
+    key_bytes = base64.b64decode(key_record["key_b64"])
+    aesgcm = AESGCM(key_bytes)
+
+    nonce = base64.b64decode(enc_record["nonce_b64"])
+    ciphertext = base64.b64decode(enc_record["ciphertext_b64"])
+
+    plaintext_bytes = aesgcm.decrypt(nonce, ciphertext, None)
+    plaintext = plaintext_bytes.decode("utf-8")
+
+    # Optional integrity check via BLAKE3
+    expected = enc_record.get("plaintext_hash_b3")
+    if expected:
+        actual = blake3_hex(plaintext_bytes)
+        if actual != expected:
+            raise ValueError("Integrity check failed: plaintext hash mismatch.")
+
+    return plaintext
+
+
+def cmd_init() -> None:
     """
-    Placeholder for real ZKP verification.
-    Replace with integration to your proving system of choice.
+    Initialize a default key for the phone.
     """
-    log("ZKP verification placeholder: all proofs assumed valid.")
-    # Example later:
-    # - load proofs from artifacts
-    # - verify with Halo2/Plonk/etc.
-    # - raise RuntimeError if any proof fails
+    log("qphone_guard: init")
+    key_record = generate_key()
+    path = save_key(key_record)
+    print("\nQPhone Guard Key Created:")
+    print(f"- Key ID: {key_record['key_id']}")
+    print(f"- Path: {path}")
+    print(f"- Algorithm: {key_record['algorithm']}")
 
 
-def step_audit_report(step_results: list) -> None:
+def cmd_encrypt(secret: str) -> None:
     """
-    Generate a markdown audit report summarizing the run.
-    Includes environment, step results, and timestamps.
+    Encrypt a secret using the default key.
     """
-    timestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    log("qphone_guard: encrypt")
+    key_record = load_key()
+    enc_record = encrypt_secret(secret, key_record)
 
-    def fmt(val: str | None) -> str:
-        return val if val is not None else "N/A"
+    # Print compact representation for copy/paste
+    payload = base64.b64encode(json.dumps(enc_record).encode("utf-8")).decode("ascii")
 
-    lines = []
-    lines.append("# QSol AutoBot Audit Report")
-    lines.append("")
-    lines.append(f"**Timestamp:** {timestamp}")
-    lines.append("")
-    lines.append("## GitHub Environment")
-    lines.append(f"- Run ID: `{fmt(ENV['GITHUB_RUN_ID'])}`")
-    lines.append(f"- Commit SHA: `{fmt(ENV['GITHUB_SHA'])}`")
-    lines.append(f"- Branch/Ref: `{fmt(ENV['GITHUB_REF'])}`")
-    lines.append(f"- Actor: `{fmt(ENV['GITHUB_ACTOR'])}`")
-    lines.append(f"- Repository: `{fmt(ENV['GITHUB_REPOSITORY'])}`")
-    lines.append(f"- Workflow: `{fmt(ENV['GITHUB_WORKFLOW'])}`")
-    lines.append("")
-    lines.append("## QSol Environment")
-    lines.append(f"- Mode: `{fmt(ENV['QSOL_MODE'])}`")
-    lines.append(f"- Environment: `{fmt(ENV['QSOL_ENV'])}`")
-    lines.append("")
-    lines.append("## Step Results")
+    print("\nEncrypted Secret (QPhone Guard Payload):")
+    print(payload)
+    log(f"Encrypted secret with key_id={key_record['key_id']}")
 
-    overall_status = "SUCCESS"
-    for r in step_results:
-        name = r["name"]
-        status = r["status"]
-        duration = r["duration"]
-        error = r["error"]
 
-        if status != "SUCCESS":
-            overall_status = "FAILED"
+def cmd_decrypt(payload: str) -> None:
+    """
+    Decrypt a secret previously produced by cmd_encrypt.
+    """
+    log("qphone_guard: decrypt")
+    try:
+        raw = base64.b64decode(payload)
+        enc_record = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Invalid payload format: {exc}")
 
-        lines.append(f"- **{name}**")
-        lines.append(f"  - Status: `{status}`")
-        lines.append(f"  - Duration: `{duration:.2f}s`")
-        if error:
-            lines.append(f"  - Error: `{error}`")
+    key_record = load_key()
+    plaintext = decrypt_secret(enc_record, key_record)
 
-    lines.append("")
-    lines.append(f"## Overall Status")
-    lines.append(f"- `{overall_status}`")
-    lines.append("")
-    lines.append("> Auto-generated by QSol AutoBot.")
+    print("\nDecrypted Secret:")
+    print(plaintext)
+    log(f"Decrypted secret with key_id={key_record['key_id']}")
 
-    AUDIT_REPORT_PATH.write_text("\n".join(lines))
-    log(f"Audit report written to {AUDIT_REPORT_PATH}")
 
-# ---------- Main orchestration ----------
+def usage() -> None:
+    print(
+        """
+QPhone Guard — Quantum-Aware Phone Security Shell
 
-def main() -> int:
-    log("=== QSol AutoBot Starting ===")
+Usage:
+  python scripts/qphone_guard.py init
+      Generate and store a new default key (AES-256-GCM, BLAKE3-anchored).
 
-    log("Environment snapshot:")
-    for k, v in ENV.items():
-        log(f"  {k} = {v}")
+  python scripts/qphone_guard.py encrypt "my secret"
+      Encrypt a secret string and print a compact payload.
 
-    step_results = []
+  python scripts/qphone_guard.py decrypt "<payload>"
+      Decrypt a payload produced by the 'encrypt' command.
 
-    # Order of execution is your canonical pipeline
-    step_results.append(run_step("Tests", step_tests))
-    step_results.append(run_step("Build", step_build))
-    step_results.append(run_step("Hash Repo (BLAKE3)", step_hash_repo))
-    step_results.append(run_step("ZKP Verify", step_zkp_verify))
-    step_results.append(run_step("Audit Report", lambda: step_audit_report(step_results)))
+Notes:
+  - Keys are stored under: lineage/qphone_keys/
+  - Activity is logged to: lineage/qphone_activity.log
+  - This is symmetric encryption ready to be wrapped by a phone client or API.
+"""
+    )
 
-    # Determine overall success/failure
-    failed_steps = [r for r in step_results if r["status"] != "SUCCESS"]
-    if failed_steps:
-        log("QSol AutoBot completed with FAILURES:")
-        for r in failed_steps:
-            log(f"  - {r['name']}: {r['error']}")
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        usage()
         return 1
 
-    log("QSol AutoBot completed SUCCESSFULLY.")
-    return 0
+    cmd = argv[1].lower()
+
+    if cmd == "init":
+        cmd_init()
+        return 0
+    elif cmd == "encrypt":
+        if len(argv) < 3:
+            print("Error: missing secret to encrypt.")
+            return 1
+        secret = argv[2]
+        cmd_encrypt(secret)
+        return 0
+    elif cmd == "decrypt":
+        if len(argv) < 3:
+            print("Error: missing payload to decrypt.")
+            return 1
+        payload = argv[2]
+        cmd_decrypt(payload)
+        return 0
+    else:
+        usage()
+        return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main(os.sys.argv))
