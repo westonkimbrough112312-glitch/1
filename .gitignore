@@ -1,0 +1,21 @@
+# QPhone Guard — DO NOT COMMIT SECRETS
+lineage/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# GitHub Actions temp
+*.tmp
